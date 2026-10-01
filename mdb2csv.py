@@ -264,6 +264,17 @@ def build_select_query(table_name, order_columns):
     return f"SELECT * FROM {table_expr} ORDER BY {order_expr}"
 
 
+def sort_csv_rows(rows, columns, key_columns):
+    """CSV表現の文字列順。キーが同値の場合も全列で順序を確定する。"""
+    column_index = {str(name).casefold(): i for i, name in enumerate(columns)}
+    key_indices = [column_index[str(name).casefold()] for name in key_columns
+                   if str(name).casefold() in column_index]
+    csv_rows = [tuple("" if value is None else str(value) for value in row)
+                for row in rows]
+    csv_rows.sort(key=lambda row: (tuple(row[i] for i in key_indices), row))
+    return csv_rows
+
+
 def get_access_connection(file_path):
     conn_str = (
         r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
@@ -272,18 +283,18 @@ def get_access_connection(file_path):
     return pyodbc.connect(conn_str)
 
 
-def build_warning_messages(tables_sorted_by_first_column, tables_without_sort_key, max_items=5):
+def build_warning_messages(tables_sorted_by_all_columns, tables_without_sort_key, max_items=5):
     warnings = []
-    if tables_sorted_by_first_column:
-        items = tables_sorted_by_first_column
+    if tables_sorted_by_all_columns:
+        items = tables_sorted_by_all_columns
         if max_items is not None:
-            items = tables_sorted_by_first_column[:max_items]
+            items = tables_sorted_by_all_columns[:max_items]
         limited = ", ".join(items)
         suffix = ""
-        if max_items is not None and len(tables_sorted_by_first_column) > max_items:
+        if max_items is not None and len(tables_sorted_by_all_columns) > max_items:
             suffix = " ..."
         warnings.append(
-            "注意: 一部テーブルで主キーを検出できず、先頭列でソートして出力しました。"
+            "注意: 一部テーブルで主キーを検出できず、全列の値でソートして出力しました。"
             f"\n対象: {limited}{suffix}"
         )
 
@@ -310,7 +321,7 @@ def write_export_report(
     output_dir,
     message,
     exported_files,
-    tables_sorted_by_first_column,
+    tables_sorted_by_all_columns,
     tables_without_sort_key,
     warning_messages,
 ):
@@ -325,7 +336,7 @@ def write_export_report(
         "exported_count": exported_count,
         "exported_files": exported_files,
         "output_dir": output_dir,
-        "tables_sorted_by_first_column": tables_sorted_by_first_column,
+        "tables_sorted_by_all_columns": tables_sorted_by_all_columns,
         "tables_without_sort_key": tables_without_sort_key,
         "warning_messages": warning_messages,
         "message": message.replace("\n", " "),
@@ -396,12 +407,12 @@ def export_mdb_tables_to_csv(file_path):
     exported_count = 0
     used_names = set()
     exported_files = []
-    tables_sorted_by_first_column = []
+    tables_sorted_by_all_columns = []
     tables_without_sort_key = []
 
     try:
         cursor = conn.cursor()
-        table_names = get_table_names_in_mdb_order(cursor)
+        table_names = sorted(get_table_names_in_mdb_order(cursor), key=lambda name: (name.casefold(), name))
 
         if not table_names:
             message = "出力対象のテーブルが見つかりませんでした。"
@@ -412,40 +423,32 @@ def export_mdb_tables_to_csv(file_path):
         for table_name in table_names:
             save_path = build_unique_save_path(output_dir, table_name, used_names)
             pk_columns = get_primary_key_columns(cursor, table_name)
-            order_columns = pk_columns
-
-            if not order_columns:
-                col_names = get_table_column_names(cursor, table_name)
-                if col_names:
-                    order_columns = [col_names[0]]
-                    tables_sorted_by_first_column.append(table_name)
-                else:
-                    tables_without_sort_key.append(table_name)
-
-            query = build_select_query(table_name, order_columns)
-            cursor.execute(query)
-
+            # Access の照合順序や物理的な格納順に依存させず、CSVの値で並べる。
+            # Memo/OLE列もSQLのORDER BYに指定する必要がない。
+            cursor.execute(build_select_query(table_name, []))
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = cursor.fetchall()
+            rows = sort_csv_rows(cursor.fetchall(), columns, pk_columns)
+            if not pk_columns:
+                tables_sorted_by_all_columns.append(table_name)
 
             with open(save_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 if columns:
                     writer.writerow(columns)
                 for row in rows:
-                    writer.writerow([value if value is not None else "" for value in row])
+                    writer.writerow(row)
 
             exported_files.append(os.path.basename(save_path))
             exported_count += 1
 
         base_message = f"{exported_count} テーブルをCSV出力しました。\n保存先: {output_dir}"
         popup_warning_messages = build_warning_messages(
-            tables_sorted_by_first_column=tables_sorted_by_first_column,
+            tables_sorted_by_all_columns=tables_sorted_by_all_columns,
             tables_without_sort_key=tables_without_sort_key,
             max_items=5,
         )
         warning_messages = build_warning_messages(
-            tables_sorted_by_first_column=tables_sorted_by_first_column,
+            tables_sorted_by_all_columns=tables_sorted_by_all_columns,
             tables_without_sort_key=tables_without_sort_key,
             max_items=None,
         )
@@ -464,7 +467,7 @@ def export_mdb_tables_to_csv(file_path):
             exported_count,
             output_dir,
             exported_files,
-            tables_sorted_by_first_column,
+            tables_sorted_by_all_columns,
             tables_without_sort_key,
             warning_messages,
             report_message,
@@ -478,7 +481,7 @@ def export_mdb_tables_to_csv(file_path):
                 exported_count,
                 output_dir,
                 exported_files,
-                tables_sorted_by_first_column,
+                tables_sorted_by_all_columns,
                 tables_without_sort_key,
                 [],
                 message,
@@ -490,7 +493,7 @@ def export_mdb_tables_to_csv(file_path):
             exported_count,
             output_dir,
             exported_files,
-            tables_sorted_by_first_column,
+            tables_sorted_by_all_columns,
             tables_without_sort_key,
             [],
             message,
@@ -522,7 +525,7 @@ def main():
             exported_count,
             output_dir,
             exported_files,
-            tables_sorted_by_first_column,
+            tables_sorted_by_all_columns,
             tables_without_sort_key,
             warning_messages,
             report_message,
@@ -537,7 +540,7 @@ def main():
                 output_dir=output_dir,
                 message=report_message,
                 exported_files=exported_files,
-                tables_sorted_by_first_column=tables_sorted_by_first_column,
+                tables_sorted_by_all_columns=tables_sorted_by_all_columns,
                 tables_without_sort_key=tables_without_sort_key,
                 warning_messages=warning_messages,
             )
